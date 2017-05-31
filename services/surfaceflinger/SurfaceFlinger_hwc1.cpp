@@ -1,4 +1,8 @@
 /*
+ * Copyright (c) 2016, The Linux Foundation. All rights reserved.
+ * Not a Contribution
+ *
+ *
  * Copyright (C) 2007 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,6 +63,7 @@
 #include <private/android_filesystem_config.h>
 #include <private/gui/SyncFeatures.h>
 
+#include "./DisplayUtils.h"
 #include <set>
 
 #include "Client.h"
@@ -81,6 +86,9 @@
 
 #include "RenderEngine/RenderEngine.h"
 #include <cutils/compiler.h>
+
+#include <ExSurfaceFlinger/ExSurfaceFlinger.h>
+
 
 #define DISPLAY_COUNT       1
 
@@ -457,26 +465,39 @@ void SurfaceFlinger::init() {
     eglInitialize(mEGLDisplay, NULL, NULL);
 
     // start the EventThread
-    sp<VSyncSource> vsyncSrc = new DispSyncSource(&mPrimaryDispSync,
-            vsyncPhaseOffsetNs, true, "app");
-    mEventThread = new EventThread(vsyncSrc, *this);
-    sp<VSyncSource> sfVsyncSrc = new DispSyncSource(&mPrimaryDispSync,
-            sfVsyncPhaseOffsetNs, true, "sf");
-    mSFEventThread = new EventThread(sfVsyncSrc, *this);
-    mEventQueue.setEventThread(mSFEventThread);
-
-    // set SFEventThread to SCHED_FIFO to minimize jitter
-    struct sched_param param = {0};
-    param.sched_priority = 2;
-    if (sched_setscheduler(mSFEventThread->getTid(), SCHED_FIFO, &param) != 0) {
-        ALOGE("Couldn't set SCHED_FIFO for SFEventThread");
+    if (vsyncPhaseOffsetNs != sfVsyncPhaseOffsetNs) {
+        sp<VSyncSource> vsyncSrc = new DispSyncSource(&mPrimaryDispSync,
+                vsyncPhaseOffsetNs, true, "app");
+        mEventThread = new EventThread(vsyncSrc, *this);
+        sp<VSyncSource> sfVsyncSrc = new DispSyncSource(&mPrimaryDispSync,
+                sfVsyncPhaseOffsetNs, true, "sf");
+        mSFEventThread = new EventThread(sfVsyncSrc, *this);
+        mEventQueue.setEventThread(mSFEventThread);
+		
+       // set SFEventThread to SCHED_FIFO to minimize jitter
+       struct sched_param param = {0};
+       param.sched_priority = 2;
+       if (sched_setscheduler(mSFEventThread->getTid(), SCHED_FIFO, &param) != 0) {
+           ALOGE("Couldn't set SCHED_FIFO for SFEventThread");
+       }
+    } else {
+        sp<VSyncSource> vsyncSrc = new DispSyncSource(&mPrimaryDispSync,
+                         vsyncPhaseOffsetNs, true, "sf-app");
+        mEventThread = new EventThread(vsyncSrc, *this);
+        mEventQueue.setEventThread(mEventThread);
+		
+       // set EventThread to SCHED_FIFO to minimize jitter
+       struct sched_param param = {0};
+       param.sched_priority = 2;
+       if (sched_setscheduler(mEventThread->getTid(), SCHED_FIFO, &param) != 0) {
+           ALOGE("Couldn't set SCHED_FIFO for SFEventThread");
+       }
     }
-
 
     // Initialize the H/W composer object.  There may or may not be an
     // actual hardware composer underneath.
-    mHwc = new HWComposer(this,
-            *static_cast<HWComposer::EventHandler *>(this));
+    mHwc = DisplayUtils::getInstance()->getHWCInstance(this,
+        *static_cast<HWComposer::EventHandler *>(this));
 
     // get a RenderEngine for the given display / config (can't fail)
     mRenderEngine = RenderEngine::create(mEGLDisplay, mHwc->getVisualID());
@@ -515,6 +536,14 @@ void SurfaceFlinger::init() {
                 // assume a connected display is unblanked.
                 ALOGD("marking display %zu as acquired/unblanked", i);
                 hw->setPowerMode(HWC_POWER_MODE_NORMAL);
+            }
+
+            // When a non-virtual display device is added at boot time,
+            // update the active config by querying HWC otherwise the
+            // default config (config 0) will be used.
+            int activeConfig = mHwc->getActiveConfig(hwcId);
+            if (activeConfig >= 0) {
+                hw->setActiveConfig(activeConfig);
             }
             mDisplays.add(token, hw);
         }
@@ -703,8 +732,10 @@ void SurfaceFlinger::setActiveConfigInternal(const sp<DisplayDevice>& hw, int mo
         return;
     }
 
-    hw->setActiveConfig(mode);
-    getHwComposer().setActiveConfig(type, mode);
+    status_t status = getHwComposer().setActiveConfig(type, mode);
+    if (status == NO_ERROR) {
+        hw->setActiveConfig(mode);
+    }
 }
 
 status_t SurfaceFlinger::setActiveConfig(const sp<IBinder>& display, int mode) {
@@ -802,10 +833,53 @@ status_t SurfaceFlinger::getAnimationFrameStats(FrameStats* outStats) const {
     return NO_ERROR;
 }
 
-status_t SurfaceFlinger::getHdrCapabilities(const sp<IBinder>& /*display*/,
+status_t SurfaceFlinger::getHdrCapabilities(const sp<IBinder>& display,
         HdrCapabilities* outCapabilities) const {
-    // HWC1 does not provide HDR capabilities
+
+    if (!display.get())
+        return NAME_NOT_FOUND;
+
+    int32_t type = NAME_NOT_FOUND;
+    for (int i=0 ; i < DisplayDevice::NUM_BUILTIN_DISPLAY_TYPES ; i++) {
+        if (display == mBuiltinDisplays[i]) {
+            type = i;
+            break;
+        }
+    }
+
+    if (type < 0) {
+        return type;
+    }
+
+#ifdef QTI_BSP
+    // Call into display.qservice
+    Parcel reply;
+    sp<IServiceManager> sm(defaultServiceManager());
+    sp<IBinder> binder =
+        sm->getService(String16("display.qservice"));
+    Parcel input;
+    input.writeInterfaceToken(String16("android.display.IQService"));
+    input.writeInt32(type);
+    // GET_HDR_CAPABILITIES = 35 from IQService.h
+    binder->transact(35, input, &reply);
+    if (outCapabilities != nullptr) {
+        outCapabilities->readFromParcel(&reply);
+        if (outCapabilities->getSupportedHdrTypes().size() != 0) {
+            ALOGD("HDR support on display: %d", type);
+            for (auto hdrtype : outCapabilities->getSupportedHdrTypes()) {
+                ALOGD(" HDR type: %d", hdrtype);
+            }
+            ALOGD(" HDR max luminance: %f", outCapabilities->getDesiredMaxLuminance());
+            ALOGD(" HDR max avg luminance: %f",
+                  outCapabilities->getDesiredMaxAverageLuminance());
+            ALOGD(" HDR min luminance: %f", outCapabilities->getDesiredMinLuminance());
+        } else {
+            ALOGI("HDR is not supported on display: %d", type);
+        }
+    }
+#else
     *outCapabilities = HdrCapabilities();
+#endif
     return NO_ERROR;
 }
 
@@ -941,6 +1015,7 @@ void SurfaceFlinger::onHotplugReceived(int type, bool connected) {
         } else {
             mCurrentState.displays.removeItem(mBuiltinDisplays[type]);
             mBuiltinDisplays[type].clear();
+            updateVisibleRegionsDirty();
         }
         setTransactionFlags(eDisplayTransactionNeeded);
 
@@ -1104,6 +1179,8 @@ void SurfaceFlinger::postComposition(nsecs_t refreshStartTime)
         mAnimFrameTracker.advanceFrame();
     }
 
+    dumpDrawCycle(false);
+
     if (hw->getPowerMode() == HWC_POWER_MODE_OFF) {
         return;
     }
@@ -1126,6 +1203,7 @@ void SurfaceFlinger::postComposition(nsecs_t refreshStartTime)
 }
 
 void SurfaceFlinger::rebuildLayerStacks() {
+    updateExtendedMode();
     // rebuild the visible layer list per screen
     if (CC_UNLIKELY(mVisibleRegionsDirty)) {
         ATRACE_CALL();
@@ -1141,14 +1219,13 @@ void SurfaceFlinger::rebuildLayerStacks() {
             const Transform& tr(hw->getTransform());
             const Rect bounds(hw->getBounds());
             if (hw->isDisplayOn()) {
-                SurfaceFlinger::computeVisibleRegions(layers,
+                computeVisibleRegions(hw->getHwcDisplayId(), layers,
                         hw->getLayerStack(), dirtyRegion, opaqueRegion);
 
                 const size_t count = layers.size();
                 for (size_t i=0 ; i<count ; i++) {
                     const sp<Layer>& layer(layers[i]);
-                    const Layer::State& s(layer->getDrawingState());
-                    if (s.layerStack == hw->getLayerStack()) {
+                    {
                         Region drawRegion(tr.transform(
                                 layer->visibleNonTransparentRegion));
                         drawRegion.andSelf(bounds);
@@ -1228,6 +1305,8 @@ void SurfaceFlinger::setUpHWComposer() {
             sp<const DisplayDevice> hw(mDisplays[dpy]);
             const int32_t id = hw->getHwcDisplayId();
             if (id >= 0) {
+                bool freezeSurfacePresent = false;
+                isfreezeSurfacePresent(freezeSurfacePresent, hw, id);
                 const Vector< sp<Layer> >& currentLayers(
                     hw->getVisibleLayersSortedByZ());
                 const size_t count = currentLayers.size();
@@ -1240,6 +1319,7 @@ void SurfaceFlinger::setUpHWComposer() {
                      */
                     const sp<Layer>& layer(currentLayers[i]);
                     layer->setPerFrameData(hw, *cur);
+                    setOrientationEventControl(freezeSurfacePresent,id);
                 }
             }
         }
@@ -1263,6 +1343,8 @@ void SurfaceFlinger::setUpHWComposer() {
                 }
             }
         }
+
+        dumpDrawCycle(true);
 
         status_t err = hwc.prepare();
         ALOGE_IF(err, "HWComposer::prepare failed (%s)", strerror(-err));
@@ -1503,28 +1585,33 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                         if (state.surface != NULL) {
 
                             int width = 0;
+                            DisplayUtils* displayUtils = DisplayUtils::getInstance();
                             int status = state.surface->query(
                                     NATIVE_WINDOW_WIDTH, &width);
                             ALOGE_IF(status != NO_ERROR,
                                     "Unable to query width (%d)", status);
                             int height = 0;
                             status = state.surface->query(
-                                    NATIVE_WINDOW_HEIGHT, &height);
+                                NATIVE_WINDOW_HEIGHT, &height);
                             ALOGE_IF(status != NO_ERROR,
-                                    "Unable to query height (%d)", status);
-                            if (mUseHwcVirtualDisplays &&
-                                    (MAX_VIRTUAL_DISPLAY_DIMENSION == 0 ||
-                                    (width <= MAX_VIRTUAL_DISPLAY_DIMENSION &&
-                                     height <= MAX_VIRTUAL_DISPLAY_DIMENSION))) {
-                                hwcDisplayId = allocateHwcDisplayId(state.type);
+                                "Unable to query height (%d)", status);
+                            if (MAX_VIRTUAL_DISPLAY_DIMENSION == 0 ||
+                                (width <= MAX_VIRTUAL_DISPLAY_DIMENSION &&
+                                 height <= MAX_VIRTUAL_DISPLAY_DIMENSION)) {
+                                int usage = 0;
+                                status = state.surface->query(
+                                    NATIVE_WINDOW_CONSUMER_USAGE_BITS, &usage);
+                                ALOGW_IF(status != NO_ERROR,
+                                    "Unable to query usage (%d)", status);
+                                if ( (status == NO_ERROR) &&
+                                      displayUtils->canAllocateHwcDisplayIdForVDS(usage)) {
+                                    hwcDisplayId = allocateHwcDisplayId(state.type);
+                                }
                             }
 
-                            sp<VirtualDisplaySurface> vds = new VirtualDisplaySurface(
-                                    *mHwc, hwcDisplayId, state.surface,
-                                    bqProducer, bqConsumer, state.displayName);
-
-                            dispSurface = vds;
-                            producer = vds;
+                            displayUtils->initVDSInstance(mHwc, hwcDisplayId, state.surface,
+                                    dispSurface, producer, bqProducer, bqConsumer,
+                                    state.displayName, state.isSecure, state.type);
                         }
                     } else {
                         ALOGE_IF(state.surface!=NULL,
@@ -1540,7 +1627,7 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                     }
 
                     const wp<IBinder>& display(curr.keyAt(i));
-                    if (dispSurface != NULL) {
+                    if (dispSurface != NULL && producer != NULL) {
                         sp<DisplayDevice> hw = new DisplayDevice(this,
                                 state.type, hwcDisplayId,
                                 mHwc->getFormat(hwcDisplayId), state.isSecure,
@@ -1550,6 +1637,16 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                         hw->setProjection(state.orientation,
                                 state.viewport, state.frame);
                         hw->setDisplayName(state.displayName);
+                        // When a new display device is added update the active
+                        // config by querying HWC otherwise the default config
+                        // (config 0) will be used.
+                        if (hwcDisplayId >= DisplayDevice::DISPLAY_PRIMARY &&
+                                hwcDisplayId < DisplayDevice::NUM_BUILTIN_DISPLAY_TYPES) {
+                            int activeConfig = mHwc->getActiveConfig(hwcDisplayId);
+                            if (activeConfig >= 0) {
+                                hw->setActiveConfig(activeConfig);
+                            }
+                        }
                         mDisplays.add(display, hw);
                         if (state.isVirtualDisplay()) {
                             if (hwcDisplayId >= 0) {
@@ -1710,7 +1807,7 @@ void SurfaceFlinger::commitTransaction()
     mTransactionCV.broadcast();
 }
 
-void SurfaceFlinger::computeVisibleRegions(
+void SurfaceFlinger::computeVisibleRegions(size_t dpy,
         const LayerVector& currentLayers, uint32_t layerStack,
         Region& outDirtyRegion, Region& outOpaqueRegion)
 {
@@ -1721,6 +1818,9 @@ void SurfaceFlinger::computeVisibleRegions(
     Region dirty;
 
     outDirtyRegion.clear();
+    bool bIgnoreLayers = false;
+    int indexLOI = -1;
+    getIndexLOI(dpy, currentLayers, bIgnoreLayers, indexLOI);
 
     size_t i = currentLayers.size();
     while (i--) {
@@ -1729,8 +1829,9 @@ void SurfaceFlinger::computeVisibleRegions(
         // start with the whole surface at its current location
         const Layer::State& s(layer->getDrawingState());
 
-        // only consider the layers on the given layer stack
-        if (s.layerStack != layerStack)
+        if(updateLayerVisibleNonTransparentRegion(dpy, layer,
+                              bIgnoreLayers, indexLOI,
+                              layerStack, i))
             continue;
 
         /*
@@ -1991,7 +2092,8 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
         }
 
         // Never touch the framebuffer if we don't have any framebuffer layers
-        const bool hasHwcComposition = hwc.hasHwcComposition(id);
+        const bool hasHwcComposition = hwc.hasHwcComposition(id) ||
+                    isS3DLayerPresent(hw);
         if (hasHwcComposition) {
             // when using overlays, we assume a fully transparent framebuffer
             // NOTE: we could reduce how much we need to clear, for instance
@@ -2017,7 +2119,7 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
             // screen is already cleared here
             if (!region.isEmpty()) {
                 // can happen with SurfaceView
-                drawWormhole(hw, region);
+                drawWormHoleIfRequired(cur, end, hw, region);
             }
         }
 
@@ -2165,6 +2267,8 @@ void SurfaceFlinger::setTransactionState(
         uint32_t flags)
 {
     ATRACE_CALL();
+
+    delayDPTransactionIfNeeded(displays);
     Mutex::Autolock _l(mStateLock);
     uint32_t transactionFlags = 0;
 
@@ -2369,6 +2473,10 @@ uint32_t SurfaceFlinger::setClientStateLocked(
             // We don't trigger a traversal here because if no other state is
             // changed, we don't want this to cause any more work
         }
+        if (what & layer_state_t::eColorChanged) {
+            if (layer->setColor(s.color))
+                flags |= eTraversalNeeded;
+        }
     }
     return flags;
 }
@@ -2434,7 +2542,7 @@ status_t SurfaceFlinger::createNormalLayer(const sp<Client>& client,
         break;
     }
 
-    *outLayer = new Layer(this, client, name, w, h, flags);
+    *outLayer = DisplayUtils::getInstance()->getLayerInstance(this, client, name, w, h, flags);
     status_t err = (*outLayer)->setBuffers(w, h, format, flags);
     if (err == NO_ERROR) {
         *handle = (*outLayer)->getHandle();
@@ -3000,7 +3108,7 @@ SurfaceFlinger::getLayerSortedByZForHwcDisplay(int id) {
         }
     }
     if (dpy == NULL) {
-        ALOGE("getLayerSortedByZForHwcDisplay: invalid hwc display id %d", id);
+        ALOGW("getLayerSortedByZForHwcDisplay: invalid hwc display id %d", id);
         // Just use the primary display so we have something to return
         dpy = getBuiltInDisplay(DisplayDevice::DISPLAY_PRIMARY);
     }
@@ -3186,12 +3294,14 @@ status_t SurfaceFlinger::onTransact(
             }
             case 1018: { // Modify Choreographer's phase offset
                 n = data.readInt32();
-                mEventThread->setPhaseOffset(static_cast<nsecs_t>(n));
+                if (mEventThread != NULL)
+                    mEventThread->setPhaseOffset(static_cast<nsecs_t>(n));
                 return NO_ERROR;
             }
             case 1019: { // Modify SurfaceFlinger's phase offset
                 n = data.readInt32();
-                mSFEventThread->setPhaseOffset(static_cast<nsecs_t>(n));
+                if (mSFEventThread != NULL)
+                    mSFEventThread->setPhaseOffset(static_cast<nsecs_t>(n));
                 return NO_ERROR;
             }
             case 1021: { // Disable HWC virtual displays
@@ -3465,6 +3575,17 @@ void SurfaceFlinger::renderScreenImplLocked(
     // make sure to clear all GL error flags
     engine.checkErrors();
 
+    if (DisplayDevice::DISPLAY_PRIMARY == hw->getDisplayType()) {
+        rotation = (Transform::orientation_flags)
+                (rotation ^ hw->getPanelMountFlip());
+        if(hw->getPanelMountFlip() == Transform::orientation_flags::ROT_180)
+        {
+            sourceCrop.top = hw_h - sourceCrop.top;
+            sourceCrop.bottom = hw_h - sourceCrop.bottom;
+            yswap = false;
+        }
+    }
+
     // set-up our viewport
     engine.setViewportAndProjection(
         reqWidth, reqHeight, sourceCrop, hw_h, yswap, rotation);
@@ -3480,7 +3601,7 @@ void SurfaceFlinger::renderScreenImplLocked(
         const Layer::State& state(layer->getDrawingState());
         if (state.layerStack == hw->getLayerStack()) {
             if (state.z >= minLayerZ && state.z <= maxLayerZ) {
-                if (layer->isVisible()) {
+                if (canDrawLayerinScreenShot(hw,layer)) {
                     if (filtering) layer->setFiltering(true);
                     layer->draw(hw, useIdentityTransform);
                     if (filtering) layer->setFiltering(false);
@@ -3682,6 +3803,42 @@ void SurfaceFlinger::checkScreenshot(size_t w, size_t s, size_t h, void const* v
                             layer->isVisible(), state.flags, state.alpha);
         }
     }
+}
+
+/* ------------------------------------------------------------------------
+ * Extensions 3503
+ */
+bool SurfaceFlinger::updateLayerVisibleNonTransparentRegion(const int& /*dpy*/,
+    const sp<Layer>& layer, bool& /*bIgnoreLayers*/, int& /*indexLOI*/,
+    uint32_t layerStack, const int& /*i*/) {
+
+    const Layer::State& s(layer->getDrawingState());
+    // only consider the layers on the given layer stack
+    if (s.layerStack != layerStack) {
+        /* set the visible region as empty since we have removed the
+         * layerstack check in rebuildLayerStack() function
+         */
+        Region visibleNonTransRegion;
+        visibleNonTransRegion.set(Rect(0,0));
+        layer->setVisibleNonTransparentRegion(visibleNonTransRegion);
+
+        return true;
+    }
+
+    return false;
+}
+
+bool SurfaceFlinger::canDrawLayerinScreenShot(
+        const sp<const DisplayDevice>& /*hw*/,
+        const sp<Layer>& layer) {
+    return layer->isVisible();
+}
+
+void SurfaceFlinger::drawWormHoleIfRequired(HWComposer::LayerListIterator& /*cur*/,
+        const HWComposer::LayerListIterator& /*end*/,
+        const sp<const DisplayDevice>& hw,
+        const Region& region) {
+    drawWormhole(hw, region);
 }
 
 // ---------------------------------------------------------------------------

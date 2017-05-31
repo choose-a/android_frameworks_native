@@ -1231,7 +1231,7 @@ void SurfaceFlinger::rebuildLayerStacks() {
             const Transform& tr(displayDevice->getTransform());
             const Rect bounds(displayDevice->getBounds());
             if (displayDevice->isDisplayOn()) {
-                SurfaceFlinger::computeVisibleRegions(layers,
+                SurfaceFlinger::computeVisibleRegions(dpy, layers,
                         displayDevice->getLayerStack(), dirtyRegion,
                         opaqueRegion);
 
@@ -1788,7 +1788,7 @@ void SurfaceFlinger::commitTransaction()
     mTransactionCV.broadcast();
 }
 
-void SurfaceFlinger::computeVisibleRegions(
+void SurfaceFlinger::computeVisibleRegions(size_t /*dpy*/,
         const LayerVector& currentLayers, uint32_t layerStack,
         Region& outDirtyRegion, Region& outOpaqueRegion)
 {
@@ -2071,7 +2071,8 @@ bool SurfaceFlinger::doComposeSurfaces(
         }
 
         // Never touch the framebuffer if we don't have any framebuffer layers
-        const bool hasDeviceComposition = mHwc->hasDeviceComposition(hwcId);
+        const bool hasDeviceComposition = mHwc->hasDeviceComposition(hwcId) ||
+                isS3DLayerPresent(displayDevice);
         if (hasDeviceComposition) {
             // when using overlays, we assume a fully transparent framebuffer
             // NOTE: we could reduce how much we need to clear, for instance
