@@ -261,6 +261,10 @@ private:
     int mPowerMode;
     // Current active config
     int mActiveConfig;
+#ifdef USE_HWC2
+    // current active color mode
+    android_color_mode_t mActiveColorMode;
+#endif
     // Panel's mount flip, H, V or 180 (HV)
     uint32_t mPanelMountFlip;
 };
